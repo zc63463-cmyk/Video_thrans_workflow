@@ -1,0 +1,3 @@
+PyYAML
+yt-dlp
+faster-whisper

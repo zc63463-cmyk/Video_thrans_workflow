@@ -1,0 +1,36 @@
+config/credentials.yaml
+config/cookies/*
+!config/cookies/.gitkeep
+output/
+scripts/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Local media and large generated artifacts
+*.mp3
+*.m4a
+*.mp4
+*.wav
+*.flac
+*.aac
+*.mkv
+
+# Secrets and local env files
+.env
+.env.*
+*.cookies.txt
+*_cookies.txt
+*.cookie
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
