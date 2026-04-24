@@ -1,6 +1,7 @@
 """Export LLM-ready bundles: metadata/source/transcript/prompt."""
 import json
 import re
+import shutil
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlencode
@@ -518,7 +519,7 @@ def write_bundle_files(
     transcript_segments: list[dict],
     timestamped_transcript: str,
     source_markdown: str,
-) -> None:
+    ) -> None:
     (bundle_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -546,6 +547,13 @@ def write_bundle_files(
     )
 
 
+def replace_bundle_dir(staging_dir: Path, bundle_dir: Path) -> None:
+    """Atomically replace the target bundle directory with a fully written staging dir."""
+    if bundle_dir.exists():
+        shutil.rmtree(bundle_dir)
+    staging_dir.replace(bundle_dir)
+
+
 def export_bundle(
     entry: VideoEntry,
     raw_data: dict,
@@ -559,7 +567,10 @@ def export_bundle(
 
     bundle_name = f"{entry.platform}-{entry.video_id}-{slugify(entry.title, max_len=50)}"
     bundle_dir = bundle_root / bundle_name
-    bundle_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = bundle_root / f".{bundle_name}.tmp"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
     transcript, transcript_segments, transcript_info = extract_transcript(
         entry,
@@ -573,7 +584,7 @@ def export_bundle(
     source_markdown = render_source_markdown(metadata, transcript)
 
     write_bundle_files(
-        bundle_dir,
+        staging_dir,
         metadata,
         raw_data,
         transcript,
@@ -582,6 +593,7 @@ def export_bundle(
         source_markdown,
     )
 
+    replace_bundle_dir(staging_dir, bundle_dir)
     return bundle_dir
 
 
@@ -640,10 +652,13 @@ def export_media_bundle(
     bundle_root = Path(output_dir)
     bundle_root.mkdir(parents=True, exist_ok=True)
     bundle_dir = bundle_root / f"local-{slugify(title, max_len=70)}"
-    bundle_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = bundle_root / f".{bundle_dir.name}.tmp"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
     write_bundle_files(
-        bundle_dir,
+        staging_dir,
         metadata,
         {"media_file": str(media_path)},
         transcript,
@@ -652,4 +667,5 @@ def export_media_bundle(
         source_markdown,
     )
 
+    replace_bundle_dir(staging_dir, bundle_dir)
     return bundle_dir
