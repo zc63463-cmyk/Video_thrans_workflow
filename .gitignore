@@ -29,6 +29,12 @@ scripts/__pycache__/
 venv/
 env/
 
+# WorkBuddy agent data
+.workbuddy/
+
+# Log files
+*.log
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

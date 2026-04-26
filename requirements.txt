@@ -1,3 +1,5 @@
 PyYAML
 yt-dlp
 faster-whisper
+tqdm>=4.60.0
+pydantic>=2.0.0
