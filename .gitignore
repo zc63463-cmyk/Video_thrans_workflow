@@ -1,7 +1,11 @@
 config/credentials.yaml
 config/cookies/*
 !config/cookies/.gitkeep
-output/
+output/bundles/*
+!output/bundles/.gitkeep
+output/notes/*
+!output/notes/.gitkeep
+output/sync.db
 scripts/__pycache__/
 *.pyc
 *.pyo

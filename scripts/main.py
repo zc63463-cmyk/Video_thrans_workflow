@@ -18,6 +18,9 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
+# 最低 Python 版本
+_MIN_PYTHON = (3, 10)
+
 # 添加 scripts 目录到路径
 sys.path.insert(0, str(SCRIPTS_DIR))
 
@@ -535,7 +538,71 @@ def build_whisper_config(config, args) -> dict:
     return whisper_cfg
 
 
+def check_python_version():
+    """检查 Python 版本是否满足最低要求。"""
+    if sys.version_info < _MIN_PYTHON:
+        print(f"[ERROR] Python {_MIN_PYTHON[0]}.{_MIN_PYTHON[1]}+ required, "
+              f"got {sys.version_info.major}.{sys.version_info.minor}")
+        sys.exit(1)
+
+
+def ensure_directories():
+    """确保必要的输出目录存在。"""
+    dirs = [
+        PROJECT_ROOT / "output",
+        PROJECT_ROOT / "output" / "bundles",
+        PROJECT_ROOT / "output" / "notes",
+    ]
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def check_dependencies():
+    """检查关键依赖是否已安装，返回缺失列表。"""
+    missing = []
+    # 必需依赖
+    for pkg, import_name in [
+        ("PyYAML", "yaml"),
+        ("yt-dlp", "yt_dlp"),
+        ("pydantic", "pydantic"),
+        ("rich", "rich"),
+        ("tqdm", "tqdm"),
+    ]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
+def first_run_setup(config_path: Path):
+    """首次运行引导：如果配置文件不存在，从模板复制。"""
+    example_path = config_path.parent / "credentials.example.yaml"
+    if not config_path.exists() and example_path.exists():
+        if console:
+            from rich.prompt import Confirm
+            console.print("\n[yellow]未找到配置文件 config/credentials.yaml[/yellow]")
+            console.print("公开视频不需要配置即可使用。收藏夹同步和需要登录的视频需要配置 cookies。")
+            if Confirm.ask("是否从模板创建配置文件？", default=True):
+                import shutil
+                shutil.copy2(example_path, config_path)
+                console.print(f"[green]已创建 {config_path}[/green]")
+                console.print("[dim]请编辑该文件填写 cookies 路径和收藏夹 URL[/dim]\n")
+        else:
+            logger.info(f"未找到配置文件，可复制 {example_path} 为 {config_path}")
+
+
 def main():
+    # 启动自检
+    check_python_version()
+
+    missing_deps = check_dependencies()
+    if missing_deps:
+        print(f"[ERROR] Missing required packages: {', '.join(missing_deps)}")
+        print(f"        Run: pip install -r requirements.txt")
+        sys.exit(1)
+
+    ensure_directories()
     # 显示启动横幅
     show_banner()
     
@@ -567,6 +634,10 @@ def main():
                 args.regenerate = False
                 args.output = str(PROJECT_ROOT / "output" / "notes")
                 args.config = str(PROJECT_ROOT / "config" / "credentials.yaml")
+                
+                # 首次运行引导
+                first_run_setup(Path(args.config))
+                
                 args.url = None
                 args.cookies = None
                 args.bundle = False
@@ -677,6 +748,7 @@ def main():
 
     # 尝试加载配置并显示状态
     config_path = Path(args.config)
+    first_run_setup(config_path)
     config = load_optional_config(config_path) if config_path.exists() else {}
     show_config_status(config_path, config)
 

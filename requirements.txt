@@ -1,5 +1,15 @@
-PyYAML
-yt-dlp
-faster-whisper
-tqdm>=4.60.0
+# Core
+PyYAML>=6.0
+yt-dlp>=2024.1.0
+
+# Config validation
 pydantic>=2.0.0
+
+# CLI & UI
+rich>=13.0.0
+tqdm>=4.60.0
+
+# Transcription (optional — needed for --transcribe and local media)
+# Uncomment one of the following if you need Whisper transcription:
+# faster-whisper>=1.0.0
+# openai-whisper>=20231117
