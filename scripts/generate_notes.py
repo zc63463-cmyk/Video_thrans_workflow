@@ -4,7 +4,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from logger_config import get_logger
+from tqdm import tqdm
+
 from fetch_base import VideoEntry
+
+logger = get_logger(__name__)
 
 
 FRONTMATTER_TEMPLATE = """---
@@ -141,11 +146,13 @@ def generate_note(entry: VideoEntry, output_dir: str = str(DEFAULT_OUTPUT_DIR)) 
 
 
 def batch_generate(entries: list[VideoEntry], output_dir: str = str(DEFAULT_OUTPUT_DIR)) -> list[str]:
+    """批量生成 Obsidian 笔记，带进度条"""
     paths = []
-    for entry in entries:
+    for entry in tqdm(entries, desc="生成笔记", unit="篇"):
         try:
             path = generate_note(entry, output_dir)
             paths.append(path)
         except Exception as e:
-            print(f"  生成失败 {entry.title}: {e}")
+            logger.error(f"生成失败 {entry.title}: {e}")
+    logger.info(f"完成！成功生成 {len(paths)}/{len(entries)} 篇笔记")
     return paths

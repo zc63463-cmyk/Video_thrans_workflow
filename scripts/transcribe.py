@@ -8,12 +8,31 @@ import sys
 import tempfile
 from pathlib import Path
 
+from logger_config import get_logger
+
+logger = get_logger(__name__)
+
+# 导入模型池
+try:
+    from whisper_pool import get_whisper_model
+    WHISPER_POOL_AVAILABLE = True
+except ImportError:
+    WHISPER_POOL_AVAILABLE = False
+    logger.warning("whisper_pool 模块未找到，将使用传统方式加载模型")
+
 # 国内访问 HuggingFace Hub 默认走镜像加速
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 # 复用 fetch_base 的路径解析逻辑
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# 检查 rich 是否可用（用于美化进度条）
+try:
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
+    RICH_PROGRESS_AVAILABLE = True
+except ImportError:
+    RICH_PROGRESS_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +51,7 @@ def _build_audio_download_cmd(
 ) -> list[str]:
     """
     构建 yt-dlp 音频下载命令。
-
+    
     优先下载纯音频流（不转码），避免依赖 ffmpeg。
     B站音频通常是 m4a 容器，直接下载即可。
     """
@@ -41,7 +60,7 @@ def _build_audio_download_cmd(
         # 直接下载最佳音频流，不转码（不需要 ffmpeg）
         "-f", "bestaudio[ext=m4a]/bestaudio/best",
         "--no-playlist",
-        "--no-check-certificate",
+        "--no-check-certificates",
         "--output", output_path,
     ]
     if cookies_file and Path(cookies_file).exists():
@@ -57,7 +76,7 @@ def download_audio(
 ) -> tuple[str, str] | None:
     """
     用 yt-dlp 从视频 URL 提取音频流。
-
+    
     Returns:
         (audio_path, temp_dir) - 音频文件路径和临时目录（调用方负责清理）
         None - 提取失败
@@ -81,22 +100,22 @@ def download_audio(
             timeout=600,
         )
         if result.returncode != 0:
-            print(f"[Transcribe] 音频下载失败: {result.stderr[-300:]}")
+            logger.error(f"音频下载失败: {result.stderr[-300:]}")
             return None
 
         # 找生成的音频文件
         audio_files = list(temp_path.glob("audio.*"))
         if not audio_files:
-            print(f"[Transcribe] 音频文件未生成，yt-dlp 输出: {result.stdout[-200:]}")
+            logger.error(f"音频文件未生成，yt-dlp 输出: {result.stdout[-200:]}")
             return None
 
         return str(audio_files[0]), str(temp_path)
 
     except subprocess.TimeoutExpired:
-        print("[Transcribe] 音频下载超时（10分钟）")
+        logger.error("音频下载超时（10分钟）")
         return None
     except Exception as e:
-        print(f"[Transcribe] 音频下载异常: {e}")
+        logger.error(f"音频下载异常: {e}")
         return None
 
 
@@ -131,14 +150,14 @@ def transcribe_audio(
 ) -> tuple[str, list[dict], dict] | None:
     """
     用 Whisper 将音频转录为文字。
-
+    
     Args:
         audio_path:  音频文件路径（支持 m4a/mp3/wav 等）
         model:       模型大小，tiny/base/small/medium/large-v3
         language:    目标语言，None=自动检测
         device:      cpu/cuda
         provider:    auto/faster-whisper/native
-
+    
     Returns:
         (transcript_text, segments, info_dict) - 纯文本转录 + 分段 + 元信息
         None - 转录失败
@@ -160,27 +179,92 @@ def transcribe_audio(
             whisper_type = "openai-whisper"
 
     if transcript_module is None:
-        print("[Transcribe] 未安装可用的 Whisper 实现，请运行：")
-        print("  pip install faster-whisper")
+        logger.error("未安装可用的 Whisper 实现，请运行：")
+        logger.info("  pip install faster-whisper")
         return None
 
     try:
-        print(f"[Transcribe] 加载模型: {model} ({whisper_type})...")
+        logger.info(f"加载模型: {model} ({whisper_type})...")
 
-        if whisper_type == "faster-whisper":
-            # faster-whisper
-            compute_type = "int8" if device == "cpu" else "float16"
-            whisper_model = transcript_module(
-                model,
+        # 使用模型池获取模型
+        if WHISPER_POOL_AVAILABLE:
+            whisper_model = get_whisper_model(
+                model_name=model,
                 device=device,
-                compute_type=compute_type,
+                model_type=whisper_type,
             )
+        else:
+            # 传统方式加载模型
+            if whisper_type == "faster-whisper":
+                compute_type = "int8" if device == "cpu" else "float16"
+                whisper_model = transcript_module(
+                    model,
+                    device=device,
+                    compute_type=compute_type,
+                )
+            else:
+                whisper_model = transcript_module.load_model(model, device=device)
+
+        # 转录并显示进度
+        if whisper_type == "faster-whisper":
+            # faster-whisper 支持进度回调
+            import time
+            
+            # 获取音频时长（用于计算进度）
+            try:
+                import ffmpeg
+                probe = ffmpeg.probe(audio_path)
+                duration = float(probe['format']['duration'])
+            except:
+                duration = 0
+            
+            # 创建 rich 进度条或降级到 tqdm
+            if RICH_PROGRESS_AVAILABLE:
+                from rich.progress import Progress as RichProgress
+                progress = RichProgress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TimeRemainingColumn(),
+                )
+                pbar = progress
+                task = progress.add_task("转录中...", total=100 if duration > 0 else None)
+                last_progress = 0
+                
+                def progress_callback(current: int, total: int):
+                    """faster-whisper 进度回调"""
+                    if duration > 0:
+                        progress_value = int((current / total) * 100)
+                        progress.update(task, completed=progress_value)
+            elif duration > 0:
+                # 降级到 tqdm
+                from tqdm import tqdm
+                pbar = tqdm(total=100, desc="转录进度", unit="%")
+                last_progress = 0
+                
+                def progress_callback(current: int, total: int):
+                    """faster-whisper 进度回调"""
+                    progress = int((current / total) * 100)
+                    pbar.update(progress - last_progress)
+                    return progress
+            else:
+                pbar = None
+                progress_callback = None
+            
             segments, info = whisper_model.transcribe(
                 audio_path,
                 language=language if language else None,
                 beam_size=5,
                 vad_filter=True,
+                progress_callback=progress_callback if duration > 0 else None,
             )
+            
+            if RICH_PROGRESS_AVAILABLE and duration > 0:
+                progress.stop()
+            elif pbar is not None:
+                pbar.close()
+            
             transcript_parts = []
             segment_items = []
             for seg in segments:
@@ -202,13 +286,40 @@ def transcribe_audio(
                 "duration": info.duration,
             }
         else:
-            # openai-whisper (native)
-            whisper_model = transcript_module.load_model(model, device=device)
-            result = whisper_model.transcribe(
-                audio_path,
-                language=language if language else None,
-                fp16=(device == "cuda"),
-            )
+            # openai-whisper (native) - 不支持进度回调
+            import time
+            
+            if RICH_PROGRESS_AVAILABLE:
+                from rich.progress import Progress as RichProgress
+                from rich.progress import SpinnerColumn, TextColumn
+                
+                logger.info("开始转录（openai-whisper 不支持详细进度显示）...")
+                with RichProgress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                ) as progress:
+                    task = progress.add_task("转录中（openai-whisper）...", total=None)
+                    result = whisper_model.transcribe(
+                        audio_path,
+                        language=language if language else None,
+                        fp16=(device == "cuda"),
+                    )
+                    progress.update(task, completed=100)
+            else:
+                # 降级到 tqdm
+                from tqdm import tqdm
+                
+                logger.info("开始转录（openai-whisper 不支持进度显示）...")
+                pbar = tqdm(total=None, desc="转录中", unit="seg")  # 未知总量进度条
+                
+                result = whisper_model.transcribe(
+                    audio_path,
+                    language=language if language else None,
+                    fp16=(device == "cuda"),
+                )
+                
+                pbar.close()
+            
             full_text = result["text"].strip()
             segment_items = [
                 {
@@ -230,7 +341,7 @@ def transcribe_audio(
         return full_text, segment_items, info_dict
 
     except Exception as e:
-        print(f"[Transcribe] 转录异常: {e}")
+        logger.error(f"转录异常: {e}")
         return None
 
 
@@ -246,19 +357,22 @@ def transcribe_from_url(
 ) -> tuple[str, list[dict], dict] | None:
     """
     完整流程：从视频 URL 下载音频 → Whisper 转录 → 返回文本
-
+    
     Args:
         url:         视频 URL
         cookies_file: cookies 文件路径（用于 B站等需要登录的平台）
         config:      whisper 配置字典
         force:       强制转录（即使有字幕也转录）
-
+    
     Returns:
         (transcript_text, segments, info_dict) - 纯文本转录 + 分段 + 元信息
         None - 转录失败
     """
     config = config or {}
-    if isinstance(config, dict) and "whisper" in config:
+    # config 可能是 VideoCollectorConfig (Pydantic) 或 dict
+    if hasattr(config, "whisper") and config.whisper:
+        whisper_cfg = config.whisper.model_dump(exclude_none=True)
+    elif isinstance(config, dict) and "whisper" in config:
         whisper_cfg = config.get("whisper", {}) or {}
     else:
         whisper_cfg = config if isinstance(config, dict) else {}
@@ -268,9 +382,9 @@ def transcribe_from_url(
     device = whisper_cfg.get("device", "cpu")
     provider = whisper_cfg.get("provider", "auto")
 
-    print(f"[Transcribe] 开始语音转文字...")
-    print(f"[Transcribe]   URL: {url}")
-    print(f"[Transcribe]   模型: {model} | 语言: {language or '自动检测'} | 设备: {device}")
+    logger.info(f"开始语音转文字...")
+    logger.info(f"  URL: {url}")
+    logger.info(f"  模型: {model} | 语言: {language or '自动检测'} | 设备: {device}")
 
     result = download_audio(url, cookies_file)
     if result is None:
@@ -292,8 +406,8 @@ def transcribe_from_url(
         try:
             Path(audio_path).unlink(missing_ok=True)
             Path(temp_dir).rmdir(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"清理临时文件失败: {e}")
 
 
 def transcribe_from_file(
@@ -302,7 +416,10 @@ def transcribe_from_file(
 ) -> tuple[str, list[dict], dict] | None:
     """从本地音频/视频文件转录。"""
     config = config or {}
-    if isinstance(config, dict) and "whisper" in config:
+    # config 可能是 VideoCollectorConfig (Pydantic) 或 dict
+    if hasattr(config, "whisper") and config.whisper:
+        whisper_cfg = config.whisper.model_dump(exclude_none=True)
+    elif isinstance(config, dict) and "whisper" in config:
         whisper_cfg = config.get("whisper", {}) or {}
     else:
         whisper_cfg = config if isinstance(config, dict) else {}
@@ -314,12 +431,12 @@ def transcribe_from_file(
 
     path = Path(media_file)
     if not path.exists():
-        print(f"[Transcribe] 本地媒体文件不存在: {path}")
+        logger.error(f"本地媒体文件不存在: {path}")
         return None
 
-    print("[Transcribe] 开始本地文件语音转文字...")
-    print(f"[Transcribe]   文件: {path}")
-    print(f"[Transcribe]   模型: {model} | 语言: {language or '自动检测'} | 设备: {device}")
+    logger.info("开始本地文件语音转文字...")
+    logger.info(f"  文件: {path}")
+    logger.info(f"  模型: {model} | 语言: {language or '自动检测'} | 设备: {device}")
 
     return transcribe_audio(
         audio_path=str(path),
@@ -353,7 +470,7 @@ if __name__ == "__main__":
 
     if result:
         transcript, segments, info = result
-        print(f"\n=== 转录结果 ({info}) ===")
-        print(transcript)
+        logger.info(f"\n=== 转录结果 ({info}) ===")
+        logger.info(transcript)
     else:
-        print("[ERROR] 转录失败")
+        logger.error("转录失败")

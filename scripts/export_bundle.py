@@ -2,13 +2,17 @@
 import json
 import re
 import shutil
+from collections import Counter
 from html import unescape
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from logger_config import get_logger
 from fetch_base import VideoEntry
 from transcribe import transcribe_from_file, transcribe_from_url
+
+logger = get_logger(__name__)
 
 
 LANGUAGE_PRIORITY = [
@@ -19,6 +23,16 @@ LANGUAGE_PRIORITY = [
 SUBTITLE_EXT_PRIORITY = ["json3", "json", "srv3", "srv2", "srv1", "vtt", "srt", "ttml"]
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPT_TEMPLATE_PATH = PROJECT_ROOT / "templates" / "prompt.md"
+ASCII_STOPWORDS = {
+    "about", "after", "before", "bilibili", "channel", "episode", "from", "have",
+    "into", "just", "more", "part", "that", "their", "there", "these", "they",
+    "this", "video", "what", "when", "where", "which", "with", "would", "youtube",
+}
+CJK_STOPWORDS = {
+    "大家", "今天", "我们", "你们", "视频", "内容", "分享", "系列", "教程", "讲解",
+    "解析", "精选", "速递", "同传", "频道", "合集", "完整", "一起", "一下", "什么",
+    "为什么", "如何", "真的", "就是", "一个", "这个", "那个", "这里", "那里",
+}
 
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -66,6 +80,55 @@ def _is_transcript_usable(transcript: str, duration: float | int | None) -> bool
     if duration_value > 0 and len(transcript) < duration_value * 2:
         return False
     return True
+
+
+def _extract_reference_terms(text: str) -> list[str]:
+    terms = []
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", text or ""):
+        token = word.lower()
+        if token not in ASCII_STOPWORDS:
+            terms.append(token)
+    for word in re.findall(r"[\u4e00-\u9fff]{2,12}", text or ""):
+        if word not in CJK_STOPWORDS:
+            terms.append(word)
+    return terms
+
+
+def _build_reference_terms(entry: VideoEntry, raw_data: dict) -> list[str]:
+    counts = Counter()
+    sources = []
+    sources.extend([entry.title] * 3)
+    sources.extend((entry.tags or []) * 2)
+    sources.extend(raw_data.get("categories") or [])
+    for chapter in raw_data.get("chapters") or []:
+        if chapter.get("title"):
+            sources.append(chapter["title"])
+    description = clean_text(entry.description or "")[:400]
+    if description:
+        sources.append(description)
+
+    for source in sources:
+        counts.update(_extract_reference_terms(source))
+
+    return [term for term, _ in counts.most_common(24)]
+
+
+def _transcript_matches_context(entry: VideoEntry, raw_data: dict, transcript: str) -> tuple[bool, list[str]]:
+    reference_terms = _build_reference_terms(entry, raw_data)
+    if len(reference_terms) < 3:
+        return True, []
+    
+    transcript_text = clean_text(transcript)
+    transcript_lower = transcript_text.lower()
+    hits = []
+    for term in reference_terms:
+        if term.isascii():
+            if re.search(rf"\b{re.escape(term)}\b", transcript_lower):
+                hits.append(term)
+        elif term in transcript_text:
+            hits.append(term)
+
+    return bool(hits), hits[:8]
 
 
 def clean_text(text: str) -> str:
@@ -292,7 +355,8 @@ def bilibili_subtitle_candidates(entry: VideoEntry, cookies_file: str | None) ->
                 item.get("lan") or item.get("lan_doc") or "",
             ))
         return candidates
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Bilibili 字幕获取失败: {e}")
         return []
 
 
@@ -309,15 +373,21 @@ def extract_transcript(
                 content = fetch_url_text(item["url"])
                 transcript = parse_transcript_content(content, item.get("ext", ""))
                 segments = parse_transcript_segments(content, item.get("ext", ""))
-            except Exception:
+            except Exception as e:
+                logger.debug(f"字幕获取失败: {e}")
                 continue
 
             if transcript and _is_transcript_usable(transcript, entry.duration):
+                matches_context, matched_terms = _transcript_matches_context(entry, raw_data, transcript)
+                if not matches_context:
+                    logger.warning("Skip subtitle candidate: low relevance to video context, fallback to other sources")
+                    continue
                 return transcript, segments, {
                     "language": language,
                     "source": source_name,
                     "ext": item.get("ext", ""),
                     "url": item.get("url", ""),
+                    "matched_terms": matched_terms,
                 }
 
         for source_name, item, language in bilibili_subtitle_candidates(entry, cookies_file):
@@ -325,19 +395,25 @@ def extract_transcript(
                 content = fetch_url_text(item["url"])
                 transcript = parse_transcript_content(content, item.get("ext", ""))
                 segments = parse_transcript_segments(content, item.get("ext", ""))
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Bilibili 字幕获取失败: {e}")
                 continue
 
             if transcript and _is_transcript_usable(transcript, entry.duration):
+                matches_context, matched_terms = _transcript_matches_context(entry, raw_data, transcript)
+                if not matches_context:
+                    logger.warning("Skip subtitle candidate: low relevance to video context, fallback to Whisper")
+                    continue
                 return transcript, segments, {
                     "language": language,
                     "source": f"bilibili_{source_name}",
                     "ext": item.get("ext", ""),
                     "url": item.get("url", ""),
+                    "matched_terms": matched_terms,
                 }
 
     if force_whisper or whisper_config:
-        print("[Transcribe] 启用 Whisper 语音转文字...")
+        logger.info("启用 Whisper 语音转文字...")
         result = transcribe_from_url(
             url=entry.url,
             cookies_file=cookies_file,
@@ -519,7 +595,7 @@ def write_bundle_files(
     transcript_segments: list[dict],
     timestamped_transcript: str,
     source_markdown: str,
-    ) -> None:
+) -> None:
     (bundle_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -594,6 +670,7 @@ def export_bundle(
     )
 
     replace_bundle_dir(staging_dir, bundle_dir)
+    logger.info(f"Bundle 导出成功: {bundle_dir}")
     return bundle_dir
 
 
@@ -605,11 +682,12 @@ def export_media_bundle(
     """Export an LLM-ready bundle for a local audio/video file."""
     media_path = Path(media_file)
     if not media_path.exists():
-        print(f"[Media] 文件不存在: {media_path}")
+        logger.error(f"文件不存在: {media_path}")
         return None
 
     result = transcribe_from_file(str(media_path), config=whisper_config)
     if not result:
+        logger.error("转录失败")
         return None
 
     transcript, transcript_segments, transcript_info = result
@@ -668,4 +746,5 @@ def export_media_bundle(
     )
 
     replace_bundle_dir(staging_dir, bundle_dir)
+    logger.info(f"本地媒体 Bundle 导出成功: {bundle_dir}")
     return bundle_dir

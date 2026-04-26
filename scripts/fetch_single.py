@@ -1,12 +1,22 @@
 """Single video fetcher."""
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.request import Request, urlopen
 
 from fetch_base import BaseFetcher, VideoEntry
+
+# 确保 scripts 目录在 Python 路径中
+scripts_dir = Path(__file__).parent
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+from logger_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class SingleVideoFetcher(BaseFetcher):
@@ -30,28 +40,35 @@ class SingleVideoFetcher(BaseFetcher):
     def resolve_cookies_file(self, platform: str) -> Optional[str]:
         if self.cookies_file:
             return self.cookies_file
-        cookies_file = self.config.get(platform, {}).get("cookies_file")
-        if cookies_file and Path(cookies_file).exists():
-            return cookies_file
+        # self.config 是 VideoCollectorConfig (Pydantic 模型)，不能用 .get()
+        platform_config = getattr(self.config, platform, None)
+        if platform_config and hasattr(platform_config, 'cookies_file'):
+            cookies_file = platform_config.cookies_file
+            if cookies_file and Path(cookies_file).exists():
+                return cookies_file
         return None
 
-    def fetch_url(self, url: str) -> list[VideoEntry]:
-        entry, _ = self.fetch_url_with_raw(url)
+    def fetch_url(self, url: str, use_cache: bool = False) -> list[VideoEntry]:
+        entry, _ = self.fetch_url_with_raw(url, use_cache=use_cache)
         if entry:
             return [entry]
         return []
 
-    def fetch_url_with_raw(self, url: str) -> tuple[Optional[VideoEntry], Optional[dict]]:
+    def fetch_url_with_raw(self, url: str, use_cache: bool = False) -> tuple[Optional[VideoEntry], Optional[dict]]:
         """Fetch one video URL and keep raw metadata for bundle export."""
         self.platform = self.detect_platform(url)
+        if self.platform == "unknown":
+            logger.error(f"无法识别视频平台，不支持的 URL: {url}")
+            logger.error("支持的平台: Bilibili (bilibili.com / b23.tv), YouTube (youtube.com / youtu.be)")
+            return None, None
         self.cookies_file = self.resolve_cookies_file(self.platform)
 
         if self.cookies_file:
-            print(f"[Single] 使用 {self.platform} cookies: {self.cookies_file}")
+            logger.info(f"使用 {self.platform} cookies: {self.cookies_file}")
         else:
-            print("[Single] 未提供 cookies，将按公开视频方式抓取")
+            logger.info("未提供 cookies，将按公开视频方式抓取")
 
-        raw_data = self._run_yt_dlp(url, flat_playlist=False, single_json=True)
+        raw_data = self._run_yt_dlp(url, flat_playlist=False, single_json=True, use_cache=use_cache)
 
         for item in raw_data:
             if item.get("_type") == "playlist":
@@ -62,16 +79,24 @@ class SingleVideoFetcher(BaseFetcher):
             return entry, item
 
         if self.platform == "bilibili":
-            return self.fetch_bilibili_with_api(url)
+            return self.fetch_bilibili_with_api(url, use_cache=use_cache)
 
         return None, None
 
-    def fetch_bilibili_with_api(self, url: str) -> tuple[Optional[VideoEntry], Optional[dict]]:
+    def fetch_bilibili_with_api(self, url: str, use_cache: bool = False) -> tuple[Optional[VideoEntry], Optional[dict]]:
         bvid = self.extract_bvid(url)
         if not bvid:
             return None, None
 
-        print("[Single] yt-dlp 失败，尝试 Bilibili 公开 API fallback")
+        # 尝试从缓存获取
+        if use_cache and self.cache is not None:
+            cache_key = f"bilibili_api_{bvid}"
+            cached_result = self.cache.get(cache_key)
+            if cached_result is not None:
+                logger.debug(f"Bilibili API 缓存命中: {url[:50]}...")
+                return cached_result
+
+        logger.warning("yt-dlp 失败，尝试 Bilibili 公开 API fallback")
         api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -82,11 +107,11 @@ class SingleVideoFetcher(BaseFetcher):
             with urlopen(request, timeout=30) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
         except Exception as exc:
-            print(f"[Single] Bilibili API fallback 失败: {exc}")
+            logger.error(f"Bilibili API fallback 失败: {exc}")
             return None, None
 
         if payload.get("code") != 0:
-            print(f"[Single] Bilibili API fallback 返回错误: {payload.get('message')}")
+            logger.error(f"Bilibili API fallback 返回错误: {payload.get('message')}")
             return None, None
 
         data = payload.get("data") or {}
@@ -115,6 +140,12 @@ class SingleVideoFetcher(BaseFetcher):
         }
         entry = self._video_to_entry(raw_data)
         entry.platform = "bilibili"
+        
+        # 保存结果到缓存
+        if use_cache and self.cache is not None:
+            cache_key = f"bilibili_api_{bvid}"
+            self.cache.set(cache_key, (entry, raw_data))
+        
         return entry, raw_data
 
     @staticmethod

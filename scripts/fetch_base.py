@@ -9,6 +9,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# 确保 scripts 目录在 Python 路径中
+scripts_dir = Path(__file__).parent
+if str(scripts_dir) not in sys.path:
+    sys.path.insert(0, str(scripts_dir))
+
+from logger_config import get_logger
+from cache_manager import CacheManager
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class VideoEntry:
@@ -42,6 +52,34 @@ class BaseFetcher(ABC):
         self.config = config
         self.cookies_file = cookies_file
         self.platform = self.__class__.__name__.replace("Fetcher", "").lower()
+        self.cache = None  # 缓存管理器实例（默认：无缓存）
+        
+    def enable_cache(self, cache_dir: str = None, ttl: int = 7 * 24 * 3600):
+        """
+        启用缓存
+        
+        Args:
+            cache_dir: 缓存目录（默认：project_root/cache）
+            ttl: 缓存过期时间（秒，默认：7天）
+        """
+        self.cache = CacheManager(cache_dir=cache_dir, ttl=ttl)
+        logger.info(f"已启用缓存: {self.cache.cache_dir}")
+        
+    def _get_cache_key_for_yt_dlp(self, url: str, extra_args: list[str] = None) -> str:
+        """
+        生成 yt-dlp 调用的缓存键
+        
+        Args:
+            url: 视频 URL
+            extra_args: 额外的命令行参数
+            
+        Returns:
+            缓存键字符串
+        """
+        key_parts = [url]
+        if extra_args:
+            key_parts.extend(extra_args)
+        return "|".join(key_parts)
 
     def _build_yt_dlp_cmd(
         self,
@@ -77,8 +115,17 @@ class BaseFetcher(ABC):
         extra_args: list[str] = None,
         flat_playlist: bool = True,
         single_json: bool = False,
+        use_cache: bool = False,
     ) -> list[dict]:
         """运行 yt-dlp，返回 JSON 解析后的视频信息"""
+        # 尝试从缓存获取
+        if use_cache and self.cache is not None:
+            cache_key = self._get_cache_key_for_yt_dlp(url, extra_args)
+            cached_result = self.cache.get(cache_key)
+            if cached_result is not None:
+                logger.debug(f"yt-dlp 缓存命中: {url[:50]}...")
+                return cached_result
+        
         cmd = self._build_yt_dlp_cmd(
             url,
             output_path,
@@ -98,15 +145,21 @@ class BaseFetcher(ABC):
                     if attempt < 2:
                         time.sleep(1)
                         continue
-                    print(f"[{self.platform}] yt-dlp error: {result.stderr[:200]}")
+                    logger.error(f"[{self.platform}] yt-dlp error: {result.stderr[:200]}")
                     return []
 
                 if single_json:
                     try:
                         data = json.loads(result.stdout)
                     except json.JSONDecodeError:
-                        print(f"[{self.platform}] yt-dlp returned invalid JSON")
+                        logger.error(f"[{self.platform}] yt-dlp returned invalid JSON")
                         return []
+                    
+                    # 保存结果到缓存
+                    if use_cache and self.cache is not None:
+                        cache_key = self._get_cache_key_for_yt_dlp(url, extra_args)
+                        self.cache.set(cache_key, data if isinstance(data, list) else [data])
+                    
                     if isinstance(data, dict) and isinstance(data.get("entries"), list):
                         return data["entries"]
                     return [data]
@@ -118,12 +171,18 @@ class BaseFetcher(ABC):
                             videos.append(json.loads(line))
                         except json.JSONDecodeError:
                             continue
+                
+                # 保存结果到缓存
+                if use_cache and self.cache is not None:
+                    cache_key = self._get_cache_key_for_yt_dlp(url, extra_args)
+                    self.cache.set(cache_key, videos)
+                
                 return videos
             except Exception as e:
                 if attempt < 2:
                     time.sleep(1)
                     continue
-                print(f"[{self.platform}] Failed: {e}")
+                logger.error(f"[{self.platform}] Failed: {e}")
                 return []
 
         return []
