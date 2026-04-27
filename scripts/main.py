@@ -81,9 +81,9 @@ def show_config_status(config_path: Path, config: dict):
     
     # 检查配置文件
     if config_path.exists():
-        table.add_row("配置文件", "✅ 已加载", str(config_path))
+        table.add_row("配置文件", "[OK] 已加载", str(config_path))
     else:
-        table.add_row("配置文件", "❌ 未找到", "将使用空配置")
+        table.add_row("配置文件", "[MISSING] 未找到", "将使用空配置")
     
     # 检查 cookies
     cookies_file = None
@@ -100,9 +100,9 @@ def show_config_status(config_path: Path, config: dict):
                 break
     
     if cookies_file and Path(cookies_file).exists():
-        table.add_row("Cookies", "✅ 已配置", cookies_file)
+        table.add_row("Cookies", "[OK] 已配置", cookies_file)
     else:
-        table.add_row("Cookies", "⚠️ 未配置", "公开视频可正常抓取")
+        table.add_row("Cookies", "[WARN] 未配置", "公开视频可正常抓取")
     
     console.print(table)
     console.print()
@@ -121,10 +121,10 @@ def show_results_table(results: list, title: str = "处理结果"):
     
     for idx, result in enumerate(results, 1):
         if result is None:
-            table.add_row(str(idx), "处理失败", "❌", "-")
+            table.add_row(str(idx), "处理失败", "[FAIL]", "-")
         else:
             path = str(result) if result else "-"
-            table.add_row(str(idx), Path(path).name, "✅", path)
+            table.add_row(str(idx), Path(path).name, "[OK]", path)
     
     console.print(table)
     console.print()

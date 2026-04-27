@@ -6,6 +6,7 @@ output/bundles/*
 output/notes/*
 !output/notes/.gitkeep
 output/sync.db
+output/*.db
 scripts/__pycache__/
 *.pyc
 *.pyo

@@ -40,10 +40,14 @@ class SingleVideoFetcher(BaseFetcher):
     def resolve_cookies_file(self, platform: str) -> Optional[str]:
         if self.cookies_file:
             return self.cookies_file
-        # self.config 是 VideoCollectorConfig (Pydantic 模型)，不能用 .get()
         platform_config = getattr(self.config, platform, None)
         if platform_config and hasattr(platform_config, 'cookies_file'):
             cookies_file = platform_config.cookies_file
+            if cookies_file and Path(cookies_file).exists():
+                return cookies_file
+        if isinstance(self.config, dict):
+            platform_config = self.config.get(platform, {}) or {}
+            cookies_file = platform_config.get("cookies_file")
             if cookies_file and Path(cookies_file).exists():
                 return cookies_file
         return None
@@ -68,7 +72,7 @@ class SingleVideoFetcher(BaseFetcher):
         else:
             logger.info("未提供 cookies，将按公开视频方式抓取")
 
-        raw_data = self._run_yt_dlp(url, flat_playlist=False, single_json=True, use_cache=use_cache)
+        raw_data = self.fetch_url_raw_data(url, use_cache=use_cache)
 
         for item in raw_data:
             if item.get("_type") == "playlist":
@@ -82,6 +86,30 @@ class SingleVideoFetcher(BaseFetcher):
             return self.fetch_bilibili_with_api(url, use_cache=use_cache)
 
         return None, None
+
+    def fetch_url_raw_data(self, url: str, use_cache: bool = False) -> list[dict]:
+        """Fetch raw metadata with fallback strategies for unstable Bilibili edges."""
+        strategies = [{"name": "default", "extra_args": []}]
+        if self.platform == "bilibili":
+            strategies.extend([
+                {"name": "ipv4", "extra_args": ["--force-ipv4"]},
+                {"name": "ipv4-multi-flv", "extra_args": ["--force-ipv4", "--extractor-args", "bilibili:prefer_multi_flv"]},
+            ])
+
+        for index, strategy in enumerate(strategies, 1):
+            if strategy["name"] != "default":
+                logger.info(f"元数据抓取策略 {index}/{len(strategies)}: {strategy['name']}")
+            raw_data = self._run_yt_dlp(
+                url,
+                extra_args=strategy["extra_args"],
+                flat_playlist=False,
+                single_json=True,
+                use_cache=use_cache,
+            )
+            if raw_data:
+                return raw_data
+
+        return []
 
     def fetch_bilibili_with_api(self, url: str, use_cache: bool = False) -> tuple[Optional[VideoEntry], Optional[dict]]:
         bvid = self.extract_bvid(url)

@@ -12,7 +12,10 @@ cd Video_thrans_workflow
 # 2. 安装依赖（Python 3.10+）
 pip install -r requirements.txt
 
-# 3. 运行 — 无参数进入交互式菜单
+# 3. 迁移/部署自检
+python scripts/doctor.py
+
+# 4. 运行 — 无参数进入交互式菜单
 python scripts/main.py
 ```
 
@@ -26,6 +29,9 @@ python scripts/main.py --bundle
 
 # 指定链接
 python scripts/main.py --bundle "https://www.bilibili.com/video/BVxxxxxxxxxx/"
+
+# 强制下载音频并用 Whisper 转录
+python scripts/main.py --bundle --transcribe "https://www.bilibili.com/video/BVxxxxxxxxxx/"
 
 # 本地音频/视频 → Whisper 转录 + AI 输入包
 python scripts/main.py --media-file "path/to/podcast.mp3"
@@ -85,6 +91,23 @@ pip install faster-whisper    # 推荐，速度快
 python scripts/main.py --bundle --transcribe --whisper-model small "https://..."
 ```
 
+## 迁移部署自检
+
+换机器或更新 cookies 后，先跑诊断：
+
+```bash
+# 检查 Python / yt-dlp / 配置路径
+python scripts/doctor.py
+
+# 检查指定 B 站视频是否能解析并下载音频
+python scripts/doctor.py "https://www.bilibili.com/video/BVxxxxxxxxxx/"
+
+# 手动指定 cookies
+python scripts/doctor.py --cookies config/cookies/bilibili_netscape.txt "https://www.bilibili.com/video/BVxxxxxxxxxx/"
+```
+
+B 站音频下载会自动使用浏览器 UA、Referer、Origin、重试、IPv4 备用策略和低码率备用音频格式，降低 CDN 短时签名或 HTTP 412 导致的失败率。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--whisper-model` | small | tiny / base / small / medium / large-v3 |
@@ -137,7 +160,8 @@ python scripts/main.py --help
 | `Python 3.10+ required` | 升级 Python 版本 |
 | YouTube 429 错误 | 配置 cookies，或加 `--transcribe` 跳过字幕 |
 | B 站字幕缺失/错配 | 加 `--transcribe` 强制 Whisper 转录 |
-| Windows 终端 emoji 乱码 | 使用 Windows Terminal（而非旧版 cmd） |
+| B 站音频 HTTP 412 | 先运行 `python -m pip install -U yt-dlp`，再用 `python scripts/doctor.py "<视频链接>"` 做音频下载自检；如仍失败，更新 cookies |
+| Windows 终端 emoji 乱码 | 当前 CLI 状态文本使用 ASCII；若仍乱码，设置 `PYTHONUTF8=1` 或使用 Windows Terminal |
 | Whisper 转录很慢 | 用 `--whisper-model tiny` 测试，或 `--whisper-device cuda` |
 
 ## 项目结构
@@ -158,6 +182,7 @@ video-collector/
     fetch_youtube.py           # YouTube 收藏夹抓取
     export_bundle.py           # AI 输入包导出
     transcribe.py              # Whisper 语音转录
+    doctor.py                  # 迁移部署与音频下载诊断
     generate_notes.py          # Obsidian 笔记生成
     config_models.py           # Pydantic 配置模型
     cache_manager.py           # 缓存管理
