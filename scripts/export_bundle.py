@@ -402,7 +402,7 @@ def extract_transcript(
             if transcript and _is_transcript_usable(transcript, entry.duration):
                 matches_context, matched_terms = _transcript_matches_context(entry, raw_data, transcript)
                 if not matches_context:
-                    logger.warning("Skip subtitle candidate: low relevance to video context, fallback to Whisper")
+                    logger.warning("Skip subtitle candidate: low relevance to video context")
                     continue
                 return transcript, segments, {
                     "language": language,
@@ -412,7 +412,7 @@ def extract_transcript(
                     "matched_terms": matched_terms,
                 }
 
-    if force_whisper or whisper_config:
+    if force_whisper:
         logger.info("启用 Whisper 语音转文字...")
         result = transcribe_from_url(
             url=entry.url,

@@ -19,6 +19,12 @@ from cache_manager import CacheManager
 
 logger = get_logger(__name__)
 
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
 
 @dataclass
 class VideoEntry:
@@ -90,8 +96,15 @@ class BaseFetcher(ABC):
         single_json: bool = False,
     ) -> list[str]:
         """构建 yt-dlp 命令"""
-        cmd = [sys.executable, "-m", "yt_dlp"]
-        if self.cookies_file:
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--no-check-certificates",
+            "--extractor-retries", "3",
+            "--socket-timeout", "30",
+            "--add-headers", f"User-Agent:{BROWSER_USER_AGENT}",
+            "--add-headers", "Referer:https://www.bilibili.com/",
+        ]
+        if self.cookies_file and Path(self.cookies_file).exists():
             cmd.extend(["--cookies", self.cookies_file])
         if flat_playlist:
             cmd.append("--flat-playlist")   # 只获取列表，不下载视频

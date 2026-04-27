@@ -1,6 +1,6 @@
 # Core
 PyYAML>=6.0
-yt-dlp>=2024.1.0
+yt-dlp>=2026.3.17
 
 # Config validation
 pydantic>=2.0.0

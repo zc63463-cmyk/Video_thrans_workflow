@@ -3,6 +3,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,18 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+BILIBILI_AUDIO_FORMATS = [
+    "bestaudio[ext=m4a]/bestaudio/best",
+    "30280/30232/30216/bestaudio/best",
+    "worstaudio[ext=m4a]/worstaudio/best",
+]
+
 # 检查 rich 是否可用（用于美化进度条）
 try:
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn
@@ -48,6 +61,8 @@ def _build_audio_download_cmd(
     url: str,
     output_path: str,
     cookies_file: str | None = None,
+    format_selector: str | None = None,
+    extra_args: list[str] | None = None,
 ) -> list[str]:
     """
     构建 yt-dlp 音频下载命令。
@@ -57,16 +72,42 @@ def _build_audio_download_cmd(
     """
     cmd = [
         _get_python_executable(), "-m", "yt_dlp",
-        # 直接下载最佳音频流，不转码（不需要 ffmpeg）
-        "-f", "bestaudio[ext=m4a]/bestaudio/best",
+        # 直接下载音频流，不转码（不需要 ffmpeg）
+        "-f", format_selector or "bestaudio[ext=m4a]/bestaudio/best",
         "--no-playlist",
         "--no-check-certificates",
+        "--force-overwrites",
+        "--no-part",
+        "--no-mtime",
+        "--retries", "5",
+        "--fragment-retries", "5",
+        "--extractor-retries", "3",
+        "--socket-timeout", "30",
+        "--retry-sleep", "http:linear=1:5:1",
+        "--add-headers", f"User-Agent:{BROWSER_USER_AGENT}",
+        "--add-headers", "Referer:https://www.bilibili.com/",
+        "--add-headers", "Origin:https://www.bilibili.com",
         "--output", output_path,
     ]
     if cookies_file and Path(cookies_file).exists():
         cmd.extend(["--cookies", cookies_file])
+    if extra_args:
+        cmd.extend(extra_args)
     cmd.append(url)
     return cmd
+
+
+def _audio_download_strategies(url: str) -> list[dict]:
+    """Build retry strategies for sites with short-lived or CDN-specific audio URLs."""
+    if "bilibili.com" not in url.lower() and "b23.tv" not in url.lower():
+        return [{"name": "default", "format": "bestaudio[ext=m4a]/bestaudio/best", "extra_args": []}]
+
+    return [
+        {"name": "bilibili-best-m4a", "format": BILIBILI_AUDIO_FORMATS[0], "extra_args": []},
+        {"name": "bilibili-best-m4a-ipv4", "format": BILIBILI_AUDIO_FORMATS[0], "extra_args": ["--force-ipv4"]},
+        {"name": "bilibili-known-audio-ids", "format": BILIBILI_AUDIO_FORMATS[1], "extra_args": ["--force-ipv4"]},
+        {"name": "bilibili-low-bitrate", "format": BILIBILI_AUDIO_FORMATS[2], "extra_args": ["--force-ipv4"]},
+    ]
 
 
 def download_audio(
@@ -86,37 +127,58 @@ def download_audio(
     else:
         temp_path = Path(tempfile.mkdtemp(prefix="video_transcribe_"))
 
-    output_template = str(temp_path / "audio.%(ext)s")
+    last_error = ""
+    strategies = _audio_download_strategies(url)
 
-    cmd = _build_audio_download_cmd(url, output_template, cookies_file)
+    for index, strategy in enumerate(strategies, 1):
+        for existing in temp_path.glob("audio.*"):
+            existing.unlink(missing_ok=True)
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=600,
+        output_template = str(temp_path / "audio.%(ext)s")
+        cmd = _build_audio_download_cmd(
+            url,
+            output_template,
+            cookies_file,
+            format_selector=strategy["format"],
+            extra_args=strategy.get("extra_args") or [],
         )
-        if result.returncode != 0:
-            logger.error(f"音频下载失败: {result.stderr[-300:]}")
-            return None
 
-        # 找生成的音频文件
-        audio_files = list(temp_path.glob("audio.*"))
-        if not audio_files:
-            logger.error(f"音频文件未生成，yt-dlp 输出: {result.stdout[-200:]}")
-            return None
+        try:
+            logger.info(f"下载音频策略 {index}/{len(strategies)}: {strategy['name']}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=600,
+            )
+            if result.returncode != 0:
+                last_error = (result.stderr or result.stdout)[-800:]
+                if "HTTP Error 412" in last_error or "412" in last_error:
+                    logger.warning("音频下载遇到 HTTP 412，切换备用策略重新解析下载地址")
+                    continue
+                logger.warning(f"音频下载策略失败: {last_error[-300:]}")
+                continue
 
-        return str(audio_files[0]), str(temp_path)
+            # 找生成的音频文件
+            audio_files = [p for p in temp_path.glob("audio.*") if p.is_file() and p.stat().st_size > 0]
+            if audio_files:
+                return str(audio_files[0]), str(temp_path)
 
-    except subprocess.TimeoutExpired:
-        logger.error("音频下载超时（10分钟）")
-        return None
-    except Exception as e:
-        logger.error(f"音频下载异常: {e}")
-        return None
+            last_error = f"音频文件未生成，yt-dlp 输出: {result.stdout[-300:]}"
+            logger.warning(last_error)
+
+        except subprocess.TimeoutExpired:
+            last_error = "音频下载超时（10分钟）"
+            logger.warning(last_error)
+        except Exception as e:
+            last_error = f"音频下载异常: {e}"
+            logger.warning(last_error)
+
+    logger.error(f"音频下载失败，已尝试 {len(strategies)} 个策略。最后错误: {last_error[-500:]}")
+    shutil.rmtree(temp_path, ignore_errors=True)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -218,65 +280,31 @@ def transcribe_audio(
             except:
                 duration = 0
             
-            # 创建 rich 进度条或降级到 tqdm
-            if RICH_PROGRESS_AVAILABLE:
-                from rich.progress import Progress as RichProgress
-                progress = RichProgress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    BarColumn(),
-                    TaskProgressColumn(),
-                    TimeRemainingColumn(),
-                )
-                pbar = progress
-                task = progress.add_task("转录中...", total=100 if duration > 0 else None)
-                last_progress = 0
-                
-                def progress_callback(current: int, total: int):
-                    """faster-whisper 进度回调"""
-                    if duration > 0:
-                        progress_value = int((current / total) * 100)
-                        progress.update(task, completed=progress_value)
-            elif duration > 0:
-                # 降级到 tqdm
-                from tqdm import tqdm
-                pbar = tqdm(total=100, desc="转录进度", unit="%")
-                last_progress = 0
-                
-                def progress_callback(current: int, total: int):
-                    """faster-whisper 进度回调"""
-                    progress = int((current / total) * 100)
-                    pbar.update(progress - last_progress)
-                    return progress
-            else:
-                pbar = None
-                progress_callback = None
-            
-            segments, info = whisper_model.transcribe(
-                audio_path,
-                language=language if language else None,
-                beam_size=5,
-                vad_filter=True,
-                progress_callback=progress_callback if duration > 0 else None,
-            )
-            
-            if RICH_PROGRESS_AVAILABLE and duration > 0:
-                progress.stop()
-            elif pbar is not None:
-                pbar.close()
-            
-            transcript_parts = []
-            segment_items = []
-            for seg in segments:
-                text = seg.text.strip()
-                if not text:
-                    continue
-                transcript_parts.append(text)
-                segment_items.append({
-                    "start": float(seg.start),
-                    "end": float(seg.end),
-                    "text": text,
-                })
+            def collect_segments(segment_iter):
+                transcript_parts = []
+                segment_items = []
+                for seg in segment_iter:
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    transcript_parts.append(text)
+                    segment_items.append({
+                        "start": float(seg.start),
+                        "end": float(seg.end),
+                        "text": text,
+                    })
+                return transcript_parts, segment_items
+
+            transcribe_kwargs = {
+                "language": language if language else None,
+                "beam_size": 5,
+                "vad_filter": True,
+            }
+
+            logger.info("转录中...")
+            segments, info = whisper_model.transcribe(audio_path, **transcribe_kwargs)
+            transcript_parts, segment_items = collect_segments(segments)
+
             full_text = " ".join(transcript_parts)
             info_dict = {
                 "language": info.language,
@@ -290,21 +318,12 @@ def transcribe_audio(
             import time
             
             if RICH_PROGRESS_AVAILABLE:
-                from rich.progress import Progress as RichProgress
-                from rich.progress import SpinnerColumn, TextColumn
-                
                 logger.info("开始转录（openai-whisper 不支持详细进度显示）...")
-                with RichProgress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                ) as progress:
-                    task = progress.add_task("转录中（openai-whisper）...", total=None)
-                    result = whisper_model.transcribe(
-                        audio_path,
-                        language=language if language else None,
-                        fp16=(device == "cuda"),
-                    )
-                    progress.update(task, completed=100)
+                result = whisper_model.transcribe(
+                    audio_path,
+                    language=language if language else None,
+                    fp16=(device == "cuda"),
+                )
             else:
                 # 降级到 tqdm
                 from tqdm import tqdm
@@ -393,14 +412,16 @@ def transcribe_from_url(
     audio_path, temp_dir = result
 
     try:
-        transcript, segments, info = transcribe_audio(
+        result = transcribe_audio(
             audio_path=audio_path,
             model=model,
             language=language if language and language.lower() not in ("null", "auto", "") else None,
             device=device,
             provider=provider,
         )
-        return transcript, segments, info
+        if result is None:
+            return None
+        return result
     finally:
         # 清理临时音频文件
         try:
